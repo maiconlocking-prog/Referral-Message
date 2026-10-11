@@ -1,4 +1,5 @@
 import logging
+import os
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -10,7 +11,16 @@ from telegram.ext import (
 )
 
 # ================== CONFIGURAÇÃO ==================
-BOT_TOKEN = "COLE_SEU_TOKEN_AQUI"   # Token do @BotFather
+# O token é lido da variável de ambiente BOT_TOKEN
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+if not BOT_TOKEN:
+    raise ValueError(
+        "Token não encontrado!\n"
+        "Defina a variável de ambiente BOT_TOKEN antes de rodar o bot.\n"
+        "Exemplo (Linux/Mac): export BOT_TOKEN='seu_token_aqui'\n"
+        "Exemplo (Windows PowerShell): $env:BOT_TOKEN='seu_token_aqui'"
+    )
 # ==================================================
 
 # Estados da conversa
