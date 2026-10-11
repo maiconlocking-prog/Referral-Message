@@ -21,12 +21,24 @@ Bot do Telegram que copia automaticamente mensagens e mídias de um canal para o
 pip install -r requirements.txt
 ```
 
-### 3. Configurar o token
-Abra o arquivo `bot.py` e substitua:
-```python
-BOT_TOKEN = "COLE_SEU_TOKEN_AQUI"
+### 3. Definir o token (forma segura)
+
+**Nunca coloque o token no código ou no GitHub!**
+
+#### Linux / macOS:
+```bash
+export BOT_TOKEN="seu_token_aqui"
 ```
-pelo token real do seu bot.
+
+#### Windows (PowerShell):
+```powershell
+$env:BOT_TOKEN="seu_token_aqui"
+```
+
+#### Windows (CMD):
+```cmd
+set BOT_TOKEN=seu_token_aqui
+```
 
 ### 4. Rodar o bot
 ```bash
