@@ -3,6 +3,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from collections import defaultdict
 
 from telethon import TelegramClient, events
 from telethon.tl.custom import Message
@@ -47,22 +48,43 @@ copying = False
 stop_requested = False
 
 
-async def send_without_forward_tag(dest, message):
-    """Envia a mensagem sem a tag 'Encaminhado de'."""
+async def send_without_forward_tag(dest, message, keep_caption=False):
+    """Envia a mensagem sem a tag 'Encaminhado de' e sem legenda (por padrão)."""
+    caption = (message.text or None) if keep_caption else None
+    entities = message.entities if keep_caption else None
+
     if message.media:
         await client.send_file(
             dest,
             file=message.media,
-            caption=message.text or None,
-            formatting_entities=message.entities,
+            caption=caption,
+            formatting_entities=entities,
             force_document=False
         )
-    elif message.text:
+    elif message.text and keep_caption:
         await client.send_message(
             dest,
             message.text,
             formatting_entities=message.entities
         )
+
+
+async def send_album_without_tag(dest, messages):
+    """Envia um álbum (várias imagens juntas) sem tag e sem legendas."""
+    files = []
+    for msg in messages:
+        if msg.media:
+            files.append(msg.media)
+
+    if not files:
+        return
+
+    # Envia como álbum (sem legenda)
+    await client.send_file(
+        dest,
+        file=files,
+        caption=None
+    )
 
 
 # ========== COMANDOS ==========
@@ -81,9 +103,9 @@ async def cmd_start(event: Message):
         "/status\n"
         "→ Mostra a configuração atual\n\n"
         "/copyimages\n"
-        "→ Copia **todas as imagens** já existentes (sem tag)\n\n"
+        "→ Copia **todas as imagens** (sem tag e **sem legendas**)\n\n"
         "/copyall\n"
-        "→ Copia **todas as mensagens** (sem tag)\n\n"
+        "→ Copia **todas as mensagens** (sem tag e sem legendas)\n\n"
         "/stopcopy\n"
         "→ **Para** a cópia em andamento\n\n"
         "/stop\n"
@@ -189,15 +211,29 @@ async def copy_history(event: Message, only_photos: bool = True):
     stop_requested = False
     tipo = "imagens" if only_photos else "todas as mensagens"
     status_msg = await event.reply(
-        f"🔄 Iniciando cópia de **{tipo}** (sem tag de encaminhamento)...\n"
+        f"🔄 Iniciando cópia de **{tipo}**\n"
+        f"• Sem tag de encaminhamento\n"
+        f"• Sem legendas\n"
+        f"• Álbuns preservados\n\n"
         f"Use /stopcopy para parar."
     )
 
     count = 0
     errors = 0
+    processed_groups = set()
 
     try:
+        # Primeiro coleta as mensagens (para agrupar álbuns corretamente)
+        messages = []
         async for message in client.iter_messages(source, reverse=True):
+            if only_photos and not message.photo:
+                continue
+            if not message.media and not message.text:
+                continue
+            messages.append(message)
+
+        i = 0
+        while i < len(messages):
             if stop_requested:
                 await status_msg.edit(
                     f"⏹️ Cópia interrompida pelo usuário.\n\n"
@@ -206,36 +242,71 @@ async def copy_history(event: Message, only_photos: bool = True):
                 )
                 break
 
-            if only_photos and not message.photo:
-                continue
+            message = messages[i]
 
-            if not message.media and not message.text:
-                continue
+            # Se faz parte de um álbum
+            if message.grouped_id:
+                if message.grouped_id in processed_groups:
+                    i += 1
+                    continue
 
-            try:
-                await send_without_forward_tag(dest, message)
-                count += 1
+                # Coleta todas as mensagens do mesmo álbum
+                album = [m for m in messages if m.grouped_id == message.grouped_id]
+                processed_groups.add(message.grouped_id)
 
-                if count % 10 == 0:
+                try:
+                    await send_album_without_tag(dest, album)
+                    count += len(album)
+                    await asyncio.sleep(2)
+                except FloodWaitError as e:
+                    logger.warning(f"FloodWait: esperando {e.seconds}s")
                     await status_msg.edit(
-                        f"🔄 Copiando... (sem tag)\n"
-                        f"Enviadas: **{count}**\n"
-                        f"Use /stopcopy para parar"
+                        f"⏳ Telegram pediu para esperar {e.seconds}s...\n"
+                        f"Já copiei: **{count}**"
                     )
+                    await asyncio.sleep(e.seconds + 2)
+                    try:
+                        await send_album_without_tag(dest, album)
+                        count += len(album)
+                    except Exception as e2:
+                        errors += 1
+                        logger.error(f"Erro no álbum: {e2}")
+                except Exception as e:
+                    errors += 1
+                    logger.error(f"Erro ao copiar álbum: {e}")
 
-                await asyncio.sleep(1.5)
+            else:
+                # Mensagem individual
+                try:
+                    await send_without_forward_tag(dest, message, keep_caption=False)
+                    count += 1
+                    await asyncio.sleep(1.5)
+                except FloodWaitError as e:
+                    logger.warning(f"FloodWait: esperando {e.seconds}s")
+                    await status_msg.edit(
+                        f"⏳ Telegram pediu para esperar {e.seconds}s...\n"
+                        f"Já copiei: **{count}**"
+                    )
+                    await asyncio.sleep(e.seconds + 2)
+                    try:
+                        await send_without_forward_tag(dest, message, keep_caption=False)
+                        count += 1
+                    except Exception as e2:
+                        errors += 1
+                        logger.error(f"Erro: {e2}")
+                except Exception as e:
+                    errors += 1
+                    logger.error(f"Erro ao copiar msg {message.id}: {e}")
 
-            except FloodWaitError as e:
-                logger.warning(f"FloodWait: esperando {e.seconds}s")
+            if count % 10 == 0 and count > 0:
                 await status_msg.edit(
-                    f"⏳ Telegram pediu para esperar {e.seconds} segundos...\n"
-                    f"Já copiei: **{count}**"
+                    f"🔄 Copiando...\n"
+                    f"• Sem tag | Sem legendas\n"
+                    f"Enviadas: **{count}**\n"
+                    f"Use /stopcopy para parar"
                 )
-                await asyncio.sleep(e.seconds + 2)
 
-            except Exception as e:
-                errors += 1
-                logger.error(f"Erro ao copiar msg {message.id}: {e}")
+            i += 1
 
         if not stop_requested:
             await status_msg.edit(
@@ -278,8 +349,9 @@ async def copy_handler(event: Message):
         return
 
     try:
-        await send_without_forward_tag(dest, event.message)
-        logger.info(f"Mensagem nova {event.message.id} copiada (sem tag) → {dest}")
+        # Mensagens novas também sem legenda
+        await send_without_forward_tag(dest, event.message, keep_caption=False)
+        logger.info(f"Mensagem nova {event.message.id} copiada (sem tag/legenda) → {dest}")
     except Exception as e:
         logger.error(f"Erro ao copiar mensagem nova: {e}")
 
