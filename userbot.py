@@ -1,20 +1,17 @@
 import asyncio
+import json
 import logging
 import os
+from pathlib import Path
+
 from telethon import TelegramClient, events
-from telethon.tl.types import PeerChannel
+from telethon.tl.custom import Message
 
 # ================== CONFIGURAÇÃO ==================
-# Pegue em https://my.telegram.org
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
-
-# Sessão (não precisa mudar)
 SESSION_NAME = "referral_session"
-
-# Canais (pode usar @username ou ID numérico)
-SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "")   # Ex: @canalorigem ou -1001234567890
-DEST_CHANNEL = os.getenv("DEST_CHANNEL", "")       # Ex: @canaldestino ou -1009876543210
+CONFIG_FILE = Path("config.json")
 # ==================================================
 
 logging.basicConfig(
@@ -26,45 +23,130 @@ logger = logging.getLogger(__name__)
 if not API_ID or not API_HASH:
     raise ValueError(
         "\nAPI_ID e API_HASH não encontrados!\n"
-        "1. Acesse https://my.telegram.org\n"
-        "2. Faça login com seu número\n"
-        "3. Vá em 'API development tools'\n"
-        "4. Crie um aplicativo e copie api_id e api_hash\n"
-        "5. Defina as variáveis:\n"
-        "   export API_ID=12345678\n"
-        "   export API_HASH=abcdef123456...\n"
+        "Defina as variáveis:\n"
+        "  export API_ID=12345678\n"
+        "  export API_HASH=abcdef123456...\n"
     )
 
-if not SOURCE_CHANNEL or not DEST_CHANNEL:
-    raise ValueError(
-        "\nDefina SOURCE_CHANNEL e DEST_CHANNEL:\n"
-        "export SOURCE_CHANNEL=@canalorigem\n"
-        "export DEST_CHANNEL=@canaldestino\n"
-    )
+# Carrega configuração salva
+def load_config():
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"source": None, "dest": None}
 
+def save_config(config):
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+
+config = load_config()
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
 
-@client.on(events.NewMessage(chats=SOURCE_CHANNEL))
-async def handler(event):
-    """Copia qualquer nova mensagem do canal de origem para o destino."""
+# ========== COMANDOS (envie no "Mensagens Salvas" ou em qualquer chat) ==========
+
+@client.on(events.NewMessage(pattern=r"(?i)^/start$"))
+async def cmd_start(event: Message):
+    if not event.is_private:
+        return
+    await event.reply(
+        "**Referral Message - Userbot**\n\n"
+        "Comandos disponíveis:\n\n"
+        "/setsource `@canal` ou `ID`\n"
+        "→ Define o canal de origem\n\n"
+        "/setdest `@canal` ou `ID`\n"
+        "→ Define o canal de destino\n\n"
+        "/status\n"
+        "→ Mostra a configuração atual\n\n"
+        "/stop\n"
+        "→ Para de copiar (limpa a configuração)\n\n"
+        "Envie os comandos aqui no chat privado comigo ou em Mensagens Salvas."
+    )
+
+
+@client.on(events.NewMessage(pattern=r"(?i)^/setsource\s+(.+)$"))
+async def cmd_setsource(event: Message):
+    if not event.is_private:
+        return
+    source = event.pattern_match.group(1).strip()
+    config["source"] = source
+    save_config(config)
+    await event.reply(f"✅ Canal de **origem** definido:\n`{source}`")
+    logger.info(f"Origem definida: {source}")
+
+
+@client.on(events.NewMessage(pattern=r"(?i)^/setdest\s+(.+)$"))
+async def cmd_setdest(event: Message):
+    if not event.is_private:
+        return
+    dest = event.pattern_match.group(1).strip()
+    config["dest"] = dest
+    save_config(config)
+    await event.reply(f"✅ Canal de **destino** definido:\n`{dest}`")
+    logger.info(f"Destino definido: {dest}")
+
+
+@client.on(events.NewMessage(pattern=r"(?i)^/status$"))
+async def cmd_status(event: Message):
+    if not event.is_private:
+        return
+    source = config.get("source") or "_não definido_"
+    dest = config.get("dest") or "_não definido_"
+    await event.reply(
+        f"**Configuração atual:**\n\n"
+        f"Origem: `{source}`\n"
+        f"Destino: `{dest}`"
+    )
+
+
+@client.on(events.NewMessage(pattern=r"(?i)^/stop$"))
+async def cmd_stop(event: Message):
+    if not event.is_private:
+        return
+    config["source"] = None
+    config["dest"] = None
+    save_config(config)
+    await event.reply("🛑 Cópia parada. Configuração limpa.")
+    logger.info("Configuração limpa pelo usuário")
+
+
+# ========== COPIADOR DE MENSAGENS ==========
+
+@client.on(events.NewMessage)
+async def copy_handler(event: Message):
+    source = config.get("source")
+    dest = config.get("dest")
+
+    if not source or not dest:
+        return
+
+    # Verifica se a mensagem veio do canal de origem
+    chat = await event.get_chat()
+    chat_username = f"@{chat.username}" if getattr(chat, "username", None) else None
+    chat_id = str(event.chat_id)
+
+    is_source = (
+        chat_id == str(source)
+        or (chat_username and chat_username.lower() == source.lower())
+        or str(getattr(chat, "id", "")) == str(source).replace("-100", "")
+    )
+
+    if not is_source:
+        return
+
     try:
-        # Copia a mensagem (mantém mídia, formatação etc.)
-        await event.message.forward_to(DEST_CHANNEL)
-        # Se quiser copiar sem a tag "Encaminhado de", use:
-        # await client.send_message(DEST_CHANNEL, event.message)
-        logger.info(f"Mensagem {event.message.id} copiada com sucesso")
+        await event.message.forward_to(dest)
+        logger.info(f"Mensagem {event.message.id} copiada → {dest}")
     except Exception as e:
-        logger.error(f"Erro ao copiar mensagem: {e}")
+        logger.error(f"Erro ao copiar: {e}")
 
 
 async def main():
     print("Iniciando userbot...")
     await client.start()
-    print("Userbot conectado!")
-    print(f"Monitorando: {SOURCE_CHANNEL}")
-    print(f"Enviando para: {DEST_CHANNEL}")
-    print("Pressione Ctrl+C para parar.\n")
+    me = await client.get_me()
+    print(f"Conectado como: {me.first_name} ({me.id})")
+    print("Envie /start no chat privado (ou Mensagens Salvas) para ver os comandos.\n")
     await client.run_until_disconnected()
 
 
