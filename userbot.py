@@ -42,8 +42,27 @@ def save_config(config):
 config = load_config()
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
-# Flag para evitar rodar várias cópias ao mesmo tempo
+# Controle da cópia em andamento
 copying = False
+stop_requested = False
+
+
+async def send_without_forward_tag(dest, message):
+    """Envia a mensagem sem a tag 'Encaminhado de'."""
+    if message.media:
+        await client.send_file(
+            dest,
+            file=message.media,
+            caption=message.text or None,
+            formatting_entities=message.entities,
+            force_document=False
+        )
+    elif message.text:
+        await client.send_message(
+            dest,
+            message.text,
+            formatting_entities=message.entities
+        )
 
 
 # ========== COMANDOS ==========
@@ -62,11 +81,13 @@ async def cmd_start(event: Message):
         "/status\n"
         "→ Mostra a configuração atual\n\n"
         "/copyimages\n"
-        "→ Copia **todas as imagens** já existentes do canal de origem\n\n"
+        "→ Copia **todas as imagens** já existentes (sem tag)\n\n"
         "/copyall\n"
-        "→ Copia **todas as mensagens** (texto + mídia) do canal de origem\n\n"
+        "→ Copia **todas as mensagens** (sem tag)\n\n"
+        "/stopcopy\n"
+        "→ **Para** a cópia em andamento\n\n"
         "/stop\n"
-        "→ Para de copiar mensagens novas\n\n"
+        "→ Para de copiar mensagens **novas**\n\n"
         "Envie os comandos em **Mensagens Salvas**."
     )
 
@@ -99,10 +120,12 @@ async def cmd_status(event: Message):
         return
     source = config.get("source") or "_não definido_"
     dest = config.get("dest") or "_não definido_"
+    status = "🔄 Copiando..." if copying else "⏸️ Parado"
     await event.reply(
         f"**Configuração atual:**\n\n"
         f"Origem: `{source}`\n"
-        f"Destino: `{dest}`"
+        f"Destino: `{dest}`\n"
+        f"Status: {status}"
     )
 
 
@@ -115,6 +138,19 @@ async def cmd_stop(event: Message):
     save_config(config)
     await event.reply("🛑 Cópia de mensagens novas parada.")
     logger.info("Configuração limpa pelo usuário")
+
+
+@client.on(events.NewMessage(pattern=r"(?i)^/stopcopy$"))
+async def cmd_stopcopy(event: Message):
+    if not event.is_private:
+        return
+    global stop_requested
+    if not copying:
+        await event.reply("Nenhuma cópia em andamento.")
+        return
+    stop_requested = True
+    await event.reply("⏹️ Parando a cópia... Aguarde.")
+    logger.info("Usuário solicitou parar a cópia")
 
 
 @client.on(events.NewMessage(pattern=r"(?i)^/copyimages$"))
@@ -132,7 +168,7 @@ async def cmd_copyall(event: Message):
 
 
 async def copy_history(event: Message, only_photos: bool = True):
-    global copying
+    global copying, stop_requested
 
     source = config.get("source")
     dest = config.get("dest")
@@ -146,39 +182,48 @@ async def copy_history(event: Message, only_photos: bool = True):
         return
 
     if copying:
-        await event.reply("⚠️ Já existe uma cópia em andamento. Aguarde terminar.")
+        await event.reply("⚠️ Já existe uma cópia em andamento.\nUse /stopcopy para parar.")
         return
 
     copying = True
+    stop_requested = False
     tipo = "imagens" if only_photos else "todas as mensagens"
-    status_msg = await event.reply(f"🔄 Iniciando cópia de **{tipo}**...\nIsso pode demorar.")
+    status_msg = await event.reply(
+        f"🔄 Iniciando cópia de **{tipo}** (sem tag de encaminhamento)...\n"
+        f"Use /stopcopy para parar."
+    )
 
     count = 0
     errors = 0
 
     try:
         async for message in client.iter_messages(source, reverse=True):
-            # Filtra só fotos se for /copyimages
+            if stop_requested:
+                await status_msg.edit(
+                    f"⏹️ Cópia interrompida pelo usuário.\n\n"
+                    f"Total enviado: **{count}**\n"
+                    f"Erros: **{errors}**"
+                )
+                break
+
             if only_photos and not message.photo:
                 continue
 
-            # Ignora mensagens de serviço
             if not message.media and not message.text:
                 continue
 
             try:
-                await message.forward_to(dest)
+                await send_without_forward_tag(dest, message)
                 count += 1
 
-                # Atualiza status a cada 10 mensagens
                 if count % 10 == 0:
                     await status_msg.edit(
-                        f"🔄 Copiando...\n"
-                        f"Enviadas: **{count}**"
+                        f"🔄 Copiando... (sem tag)\n"
+                        f"Enviadas: **{count}**\n"
+                        f"Use /stopcopy para parar"
                     )
 
-                # Pequena pausa para evitar flood
-                await asyncio.sleep(1.2)
+                await asyncio.sleep(1.5)
 
             except FloodWaitError as e:
                 logger.warning(f"FloodWait: esperando {e.seconds}s")
@@ -186,18 +231,19 @@ async def copy_history(event: Message, only_photos: bool = True):
                     f"⏳ Telegram pediu para esperar {e.seconds} segundos...\n"
                     f"Já copiei: **{count}**"
                 )
-                await asyncio.sleep(e.seconds + 1)
+                await asyncio.sleep(e.seconds + 2)
 
             except Exception as e:
                 errors += 1
                 logger.error(f"Erro ao copiar msg {message.id}: {e}")
 
-        await status_msg.edit(
-            f"✅ Cópia finalizada!\n\n"
-            f"Total enviado: **{count}**\n"
-            f"Erros: **{errors}**"
-        )
-        logger.info(f"Cópia finalizada: {count} mensagens, {errors} erros")
+        if not stop_requested:
+            await status_msg.edit(
+                f"✅ Cópia finalizada!\n\n"
+                f"Total enviado: **{count}**\n"
+                f"Erros: **{errors}**"
+            )
+            logger.info(f"Cópia finalizada: {count} mensagens, {errors} erros")
 
     except Exception as e:
         await status_msg.edit(f"❌ Erro durante a cópia:\n`{e}`")
@@ -205,6 +251,7 @@ async def copy_history(event: Message, only_photos: bool = True):
 
     finally:
         copying = False
+        stop_requested = False
 
 
 # ========== COPIADOR DE MENSAGENS NOVAS ==========
@@ -231,8 +278,8 @@ async def copy_handler(event: Message):
         return
 
     try:
-        await event.message.forward_to(dest)
-        logger.info(f"Mensagem nova {event.message.id} copiada → {dest}")
+        await send_without_forward_tag(dest, event.message)
+        logger.info(f"Mensagem nova {event.message.id} copiada (sem tag) → {dest}")
     except Exception as e:
         logger.error(f"Erro ao copiar mensagem nova: {e}")
 
