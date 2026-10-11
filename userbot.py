@@ -6,6 +6,7 @@ from pathlib import Path
 
 from telethon import TelegramClient, events
 from telethon.tl.custom import Message
+from telethon.errors import FloodWaitError
 
 # ================== CONFIGURAÇÃO ==================
 API_ID = int(os.getenv("API_ID", "0"))
@@ -28,7 +29,6 @@ if not API_ID or not API_HASH:
         "  export API_HASH=abcdef123456...\n"
     )
 
-# Carrega configuração salva
 def load_config():
     if CONFIG_FILE.exists():
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -42,8 +42,11 @@ def save_config(config):
 config = load_config()
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
+# Flag para evitar rodar várias cópias ao mesmo tempo
+copying = False
 
-# ========== COMANDOS (envie no "Mensagens Salvas" ou em qualquer chat) ==========
+
+# ========== COMANDOS ==========
 
 @client.on(events.NewMessage(pattern=r"(?i)^/start$"))
 async def cmd_start(event: Message):
@@ -58,9 +61,13 @@ async def cmd_start(event: Message):
         "→ Define o canal de destino\n\n"
         "/status\n"
         "→ Mostra a configuração atual\n\n"
+        "/copyimages\n"
+        "→ Copia **todas as imagens** já existentes do canal de origem\n\n"
+        "/copyall\n"
+        "→ Copia **todas as mensagens** (texto + mídia) do canal de origem\n\n"
         "/stop\n"
-        "→ Para de copiar (limpa a configuração)\n\n"
-        "Envie os comandos aqui no chat privado comigo ou em Mensagens Salvas."
+        "→ Para de copiar mensagens novas\n\n"
+        "Envie os comandos em **Mensagens Salvas**."
     )
 
 
@@ -106,11 +113,101 @@ async def cmd_stop(event: Message):
     config["source"] = None
     config["dest"] = None
     save_config(config)
-    await event.reply("🛑 Cópia parada. Configuração limpa.")
+    await event.reply("🛑 Cópia de mensagens novas parada.")
     logger.info("Configuração limpa pelo usuário")
 
 
-# ========== COPIADOR DE MENSAGENS ==========
+@client.on(events.NewMessage(pattern=r"(?i)^/copyimages$"))
+async def cmd_copyimages(event: Message):
+    if not event.is_private:
+        return
+    await copy_history(event, only_photos=True)
+
+
+@client.on(events.NewMessage(pattern=r"(?i)^/copyall$"))
+async def cmd_copyall(event: Message):
+    if not event.is_private:
+        return
+    await copy_history(event, only_photos=False)
+
+
+async def copy_history(event: Message, only_photos: bool = True):
+    global copying
+
+    source = config.get("source")
+    dest = config.get("dest")
+
+    if not source or not dest:
+        await event.reply(
+            "❌ Defina primeiro os canais:\n"
+            "/setsource @canal\n"
+            "/setdest @canal"
+        )
+        return
+
+    if copying:
+        await event.reply("⚠️ Já existe uma cópia em andamento. Aguarde terminar.")
+        return
+
+    copying = True
+    tipo = "imagens" if only_photos else "todas as mensagens"
+    status_msg = await event.reply(f"🔄 Iniciando cópia de **{tipo}**...\nIsso pode demorar.")
+
+    count = 0
+    errors = 0
+
+    try:
+        async for message in client.iter_messages(source, reverse=True):
+            # Filtra só fotos se for /copyimages
+            if only_photos and not message.photo:
+                continue
+
+            # Ignora mensagens de serviço
+            if not message.media and not message.text:
+                continue
+
+            try:
+                await message.forward_to(dest)
+                count += 1
+
+                # Atualiza status a cada 10 mensagens
+                if count % 10 == 0:
+                    await status_msg.edit(
+                        f"🔄 Copiando...\n"
+                        f"Enviadas: **{count}**"
+                    )
+
+                # Pequena pausa para evitar flood
+                await asyncio.sleep(1.2)
+
+            except FloodWaitError as e:
+                logger.warning(f"FloodWait: esperando {e.seconds}s")
+                await status_msg.edit(
+                    f"⏳ Telegram pediu para esperar {e.seconds} segundos...\n"
+                    f"Já copiei: **{count}**"
+                )
+                await asyncio.sleep(e.seconds + 1)
+
+            except Exception as e:
+                errors += 1
+                logger.error(f"Erro ao copiar msg {message.id}: {e}")
+
+        await status_msg.edit(
+            f"✅ Cópia finalizada!\n\n"
+            f"Total enviado: **{count}**\n"
+            f"Erros: **{errors}**"
+        )
+        logger.info(f"Cópia finalizada: {count} mensagens, {errors} erros")
+
+    except Exception as e:
+        await status_msg.edit(f"❌ Erro durante a cópia:\n`{e}`")
+        logger.error(f"Erro geral na cópia: {e}")
+
+    finally:
+        copying = False
+
+
+# ========== COPIADOR DE MENSAGENS NOVAS ==========
 
 @client.on(events.NewMessage)
 async def copy_handler(event: Message):
@@ -120,7 +217,6 @@ async def copy_handler(event: Message):
     if not source or not dest:
         return
 
-    # Verifica se a mensagem veio do canal de origem
     chat = await event.get_chat()
     chat_username = f"@{chat.username}" if getattr(chat, "username", None) else None
     chat_id = str(event.chat_id)
@@ -136,9 +232,9 @@ async def copy_handler(event: Message):
 
     try:
         await event.message.forward_to(dest)
-        logger.info(f"Mensagem {event.message.id} copiada → {dest}")
+        logger.info(f"Mensagem nova {event.message.id} copiada → {dest}")
     except Exception as e:
-        logger.error(f"Erro ao copiar: {e}")
+        logger.error(f"Erro ao copiar mensagem nova: {e}")
 
 
 async def main():
