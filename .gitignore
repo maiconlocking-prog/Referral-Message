@@ -3,6 +3,11 @@
 .env.*
 *.env
 
+# Telethon session (contém login da conta - NUNCA enviar)
+*.session
+*.session-journal
+referral_session*
+
 # Python
 __pycache__/
 *.py[cod]
