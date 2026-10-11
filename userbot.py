@@ -2,6 +2,8 @@ import asyncio
 import json
 import logging
 import os
+import sys
+import subprocess
 from pathlib import Path
 
 from telethon import TelegramClient, events
@@ -33,8 +35,10 @@ def load_config():
             data = json.load(f)
             if "live_jobs" not in data:
                 data["live_jobs"] = []
+            if "paused" not in data:
+                data["paused"] = False
             return data
-    return {"source": None, "dest": None, "live_jobs": []}
+    return {"source": None, "dest": None, "live_jobs": [], "paused": False}
 
 def save_config(cfg):
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -44,13 +48,12 @@ config = load_config()
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
 # Controle de cópias históricas
-history_tasks = {}          # task_id -> asyncio.Task
-stop_flags = {}             # task_id -> bool
+history_tasks = {}
+stop_flags = {}
 next_task_id = 1
 
 
 async def send_media(dest, message, with_caption=False):
-    """Envia sem tag de encaminhamento."""
     caption = (message.text or None) if with_caption else None
     entities = message.entities if with_caption else None
 
@@ -67,13 +70,11 @@ async def send_media(dest, message, with_caption=False):
 
 
 async def send_album(dest, messages, with_caption=False):
-    """Envia álbum sem tag."""
     files = [m.media for m in messages if m.media]
     if not files:
         return
     caption = None
     if with_caption:
-        # Usa a legenda da primeira mensagem que tiver texto
         for m in messages:
             if m.text:
                 caption = m.text
@@ -99,24 +100,25 @@ async def cmd_start(event: Message):
         return
     await event.reply(
         "**Referral Message – Userbot**\n\n"
-        "**1. Configurar canais temporários (para cópia histórica)**\n"
+        "**1. Configurar canais (cópia histórica)**\n"
         "/setsource `@canal`\n"
         "/setdest `@canal`\n\n"
-        "**2. Cópia do histórico (mensagens antigas)**\n"
-        "/copyimages → só imagens **sem** legenda\n"
+        "**2. Cópia do histórico**\n"
+        "/copyimages → imagens **sem** legenda\n"
         "/copyimagescaption → imagens **com** legenda\n"
         "/copyall → tudo sem legenda\n"
         "/copyallcaption → tudo com legenda\n\n"
-        "**3. Cópia ao vivo (só o que for postado a partir de agora)**\n"
+        "**3. Cópia ao vivo**\n"
         "/liveimages `@origem` `@destino`\n"
         "/liveimagescaption `@origem` `@destino`\n"
         "/liveall `@origem` `@destino`\n\n"
         "**4. Controle**\n"
-        "/status → mostra tudo que está rodando\n"
-        "/stoplive → para todas as cópias ao vivo\n"
-        "/stoplive `número` → para uma cópia ao vivo específica\n"
-        "/stopcopy → para todas as cópias de histórico\n"
-        "/stopcopy `número` → para uma cópia de histórico específica\n\n"
+        "/status\n"
+        "/pause → pausa toda cópia (bot continua ligado)\n"
+        "/resume → volta a copiar\n"
+        "/stoplive \| /stoplive `n`\n"
+        "/stopcopy \| /stopcopy `n`\n"
+        "/update → atualiza o código e reinicia sozinho\n\n"
         "Você pode rodar **várias cópias ao mesmo tempo**."
     )
 
@@ -144,30 +146,95 @@ async def cmd_status(event: Message):
     if not event.is_private:
         return
 
+    paused = config.get("paused", False)
     text = "**Status atual**\n\n"
+    text += f"Bot: {'⏸️ PAUSADO' if paused else '▶️ Ativo'}\n\n"
 
-    # Cópias de histórico
     if history_tasks:
         text += "**Cópias de histórico em andamento:**\n"
-        for tid, task in history_tasks.items():
+        for tid in history_tasks:
             text += f"  #{tid} – rodando\n"
     else:
         text += "Cópias de histórico: nenhuma\n"
 
-    # Cópias ao vivo
     jobs = config.get("live_jobs", [])
     if jobs:
-        text += "\n**Cópias ao vivo ativas:**\n"
+        text += "\n**Cópias ao vivo:**\n"
         for i, job in enumerate(jobs, 1):
-            mode = job.get("mode", "?")
-            text += f"  #{i} `{job['source']}` → `{job['dest']}` ({mode})\n"
+            text += f"  #{i} `{job['source']}` → `{job['dest']}` ({job.get('mode', '?')})\n"
     else:
         text += "\nCópias ao vivo: nenhuma\n"
 
-    text += f"\nOrigem temporária: `{config.get('source') or 'não definida'}`\n"
-    text += f"Destino temporário: `{config.get('dest') or 'não definido'}`"
-
+    text += f"\nOrigem temp: `{config.get('source') or 'não definida'}`\n"
+    text += f"Destino temp: `{config.get('dest') or 'não definido'}`"
     await event.reply(text)
+
+
+@client.on(events.NewMessage(pattern=r"(?i)^/pause$"))
+async def cmd_pause(event: Message):
+    if not event.is_private:
+        return
+    config["paused"] = True
+    save_config(config)
+    # Também para cópias de histórico em andamento
+    for tid in list(stop_flags.keys()):
+        stop_flags[tid] = True
+    await event.reply(
+        "⏸️ **Bot pausado**\n\n"
+        "• Cópias ao vivo: desativadas\n"
+        "• Cópias de histórico: interrompidas\n"
+        "• O bot continua ligado (você ainda pode usar comandos)\n\n"
+        "Use /resume para voltar."
+    )
+
+
+@client.on(events.NewMessage(pattern=r"(?i)^/resume$"))
+async def cmd_resume(event: Message):
+    if not event.is_private:
+        return
+    config["paused"] = False
+    save_config(config)
+    jobs = len(config.get("live_jobs", []))
+    await event.reply(
+        f"▶️ **Bot reativado**\n\n"
+        f"Cópias ao vivo ativas: **{jobs}**\n"
+        "Novas postagens voltarão a ser copiadas."
+    )
+
+
+@client.on(events.NewMessage(pattern=r"(?i)^/update$"))
+async def cmd_update(event: Message):
+    if not event.is_private:
+        return
+
+    await event.reply("🔄 Atualizando código do GitHub...")
+
+    try:
+        result = subprocess.run(
+            ["git", "pull"],
+            cwd=Path(__file__).parent,
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        output = (result.stdout or "") + (result.stderr or "")
+
+        if result.returncode != 0:
+            await event.reply(f"❌ Erro no git pull:\n```\n{output[-1500:]}\n```")
+            return
+
+        await event.reply(
+            f"✅ Código atualizado!\n\n```\n{output[-800:] or 'Já estava atualizado.'}\n```\n\n"
+            "Reiniciando o bot em 2 segundos..."
+        )
+        await asyncio.sleep(2)
+
+        # Reinicia o processo mantendo as variáveis de ambiente
+        python = sys.executable
+        os.execv(python, [python] + sys.argv)
+
+    except Exception as e:
+        await event.reply(f"❌ Erro ao atualizar:\n`{e}`")
 
 
 # ---------- Cópia de histórico ----------
@@ -195,6 +262,10 @@ async def cmd_copyallcaption(event: Message):
 
 async def start_history_copy(event, only_photos, with_caption):
     global next_task_id
+
+    if config.get("paused"):
+        await event.reply("⏸️ Bot está pausado. Use /resume antes.")
+        return
 
     source = config.get("source")
     dest = config.get("dest")
@@ -231,7 +302,7 @@ async def start_history_copy(event, only_photos, with_caption):
 
             i = 0
             while i < len(messages):
-                if stop_flags.get(task_id):
+                if stop_flags.get(task_id) or config.get("paused"):
                     await status.edit(
                         f"⏹️ Cópia #{task_id} interrompida.\nEnviadas: **{count}**"
                     )
@@ -280,7 +351,7 @@ async def start_history_copy(event, only_photos, with_caption):
                     )
                 i += 1
 
-            if not stop_flags.get(task_id):
+            if not stop_flags.get(task_id) and not config.get("paused"):
                 await status.edit(
                     f"✅ Cópia #{task_id} finalizada!\nTotal: **{count}** | Erros: **{errors}**"
                 )
@@ -316,7 +387,7 @@ async def cmd_stopcopy(event: Message):
         await event.reply("⏹️ Parando todas as cópias de histórico...")
 
 
-# ---------- Cópia ao vivo (só mensagens novas) ----------
+# ---------- Cópia ao vivo ----------
 
 @client.on(events.NewMessage(pattern=r"(?i)^/liveimages\s+(\S+)\s+(\S+)$"))
 async def cmd_liveimages(event: Message):
@@ -348,13 +419,13 @@ async def add_live_job(event, source, dest, mode):
     }.get(mode, mode)
 
     num = len(config["live_jobs"])
+    extra = "\n⚠️ Bot está **pausado**. Use /resume para ativar." if config.get("paused") else ""
     await event.reply(
         f"✅ Cópia ao vivo #{num} ativada\n"
         f"`{source}` → `{dest}`\n"
         f"Modo: {modo_txt}\n\n"
-        f"Só copiará o que for postado **a partir de agora**."
+        f"Só copiará o que for postado **a partir de agora**.{extra}"
     )
-    logger.info(f"Live job adicionado: {source} -> {dest} ({mode})")
 
 
 @client.on(events.NewMessage(pattern=r"(?i)^/stoplive(?:\s+(\d+))?$"))
@@ -375,17 +446,20 @@ async def cmd_stoplive(event: Message):
             save_config(config)
             await event.reply(f"⏹️ Cópia ao vivo #{idx+1} removida:\n`{removed['source']}` → `{removed['dest']}`")
         else:
-            await event.reply("Número inválido. Use /status para ver a lista.")
+            await event.reply("Número inválido. Use /status.")
     else:
         config["live_jobs"] = []
         save_config(config)
         await event.reply("⏹️ Todas as cópias ao vivo foram paradas.")
 
 
-# ---------- Handler de mensagens novas (ao vivo) ----------
+# ---------- Handler de mensagens novas ----------
 
 @client.on(events.NewMessage)
 async def live_handler(event: Message):
+    if config.get("paused"):
+        return
+
     jobs = config.get("live_jobs", [])
     if not jobs:
         return
@@ -399,18 +473,13 @@ async def live_handler(event: Message):
         mode = job["mode"]
         dest = job["dest"]
 
-        # Filtra conforme o modo
         if mode.startswith("images") and not event.message.photo:
             continue
 
         with_caption = "with_caption" in mode
 
         try:
-            if event.message.grouped_id:
-                # Para álbuns ao vivo é mais complexo; envia individual por enquanto
-                await send_media(dest, event.message, with_caption)
-            else:
-                await send_media(dest, event.message, with_caption)
+            await send_media(dest, event.message, with_caption)
             logger.info(f"Live: {event.message.id} → {dest} ({mode})")
         except Exception as e:
             logger.error(f"Erro live: {e}")
@@ -421,7 +490,9 @@ async def main():
     await client.start()
     me = await client.get_me()
     print(f"Conectado como: {me.first_name} ({me.id})")
-    print("Envie /start em Mensagens Salvas para ver todos os comandos.\n")
+    if config.get("paused"):
+        print("Estado: PAUSADO (use /resume)")
+    print("Envie /start em Mensagens Salvas para ver os comandos.\n")
     await client.run_until_disconnected()
 
 
