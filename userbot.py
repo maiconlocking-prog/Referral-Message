@@ -3,7 +3,6 @@ import json
 import logging
 import os
 from pathlib import Path
-from collections import defaultdict
 
 from telethon import TelegramClient, events
 from telethon.tl.custom import Message
@@ -25,33 +24,35 @@ logger = logging.getLogger(__name__)
 if not API_ID or not API_HASH:
     raise ValueError(
         "\nAPI_ID e API_HASH não encontrados!\n"
-        "Defina as variáveis:\n"
-        "  export API_ID=12345678\n"
-        "  export API_HASH=abcdef123456...\n"
+        "Defina: export API_ID=... e export API_HASH=..."
     )
 
 def load_config():
     if CONFIG_FILE.exists():
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"source": None, "dest": None}
+            data = json.load(f)
+            if "live_jobs" not in data:
+                data["live_jobs"] = []
+            return data
+    return {"source": None, "dest": None, "live_jobs": []}
 
-def save_config(config):
+def save_config(cfg):
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2, ensure_ascii=False)
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
 
 config = load_config()
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
-# Controle da cópia em andamento
-copying = False
-stop_requested = False
+# Controle de cópias históricas
+history_tasks = {}          # task_id -> asyncio.Task
+stop_flags = {}             # task_id -> bool
+next_task_id = 1
 
 
-async def send_without_forward_tag(dest, message, keep_caption=False):
-    """Envia a mensagem sem a tag 'Encaminhado de' e sem legenda (por padrão)."""
-    caption = (message.text or None) if keep_caption else None
-    entities = message.entities if keep_caption else None
+async def send_media(dest, message, with_caption=False):
+    """Envia sem tag de encaminhamento."""
+    caption = (message.text or None) if with_caption else None
+    entities = message.entities if with_caption else None
 
     if message.media:
         await client.send_file(
@@ -61,56 +62,62 @@ async def send_without_forward_tag(dest, message, keep_caption=False):
             formatting_entities=entities,
             force_document=False
         )
-    elif message.text and keep_caption:
-        await client.send_message(
-            dest,
-            message.text,
-            formatting_entities=message.entities
-        )
+    elif message.text and with_caption:
+        await client.send_message(dest, message.text, formatting_entities=message.entities)
 
 
-async def send_album_without_tag(dest, messages):
-    """Envia um álbum (várias imagens juntas) sem tag e sem legendas."""
-    files = []
-    for msg in messages:
-        if msg.media:
-            files.append(msg.media)
-
+async def send_album(dest, messages, with_caption=False):
+    """Envia álbum sem tag."""
+    files = [m.media for m in messages if m.media]
     if not files:
         return
+    caption = None
+    if with_caption:
+        # Usa a legenda da primeira mensagem que tiver texto
+        for m in messages:
+            if m.text:
+                caption = m.text
+                break
+    await client.send_file(dest, file=files, caption=caption)
 
-    # Envia como álbum (sem legenda)
-    await client.send_file(
-        dest,
-        file=files,
-        caption=None
+
+def is_source_match(chat, source):
+    chat_username = f"@{chat.username}" if getattr(chat, "username", None) else None
+    chat_id = str(getattr(chat, "id", ""))
+    return (
+        chat_id == str(source)
+        or (chat_username and chat_username.lower() == str(source).lower())
+        or chat_id == str(source).replace("-100", "")
     )
 
 
-# ========== COMANDOS ==========
+# ===================== COMANDOS =====================
 
 @client.on(events.NewMessage(pattern=r"(?i)^/start$"))
 async def cmd_start(event: Message):
     if not event.is_private:
         return
     await event.reply(
-        "**Referral Message - Userbot**\n\n"
-        "Comandos disponíveis:\n\n"
-        "/setsource `@canal` ou `ID`\n"
-        "→ Define o canal de origem\n\n"
-        "/setdest `@canal` ou `ID`\n"
-        "→ Define o canal de destino\n\n"
-        "/status\n"
-        "→ Mostra a configuração atual\n\n"
-        "/copyimages\n"
-        "→ Copia **todas as imagens** (sem tag e **sem legendas**)\n\n"
-        "/copyall\n"
-        "→ Copia **todas as mensagens** (sem tag e sem legendas)\n\n"
-        "/stopcopy\n"
-        "→ **Para** a cópia em andamento\n\n"
-        "/stop\n"
-        "→ Para de copiar mensagens **novas**\n\n"
-        "Envie os comandos em **Mensagens Salvas**."
+        "**Referral Message – Userbot**\n\n"
+        "**1. Configurar canais temporários (para cópia histórica)**\n"
+        "/setsource `@canal`\n"
+        "/setdest `@canal`\n\n"
+        "**2. Cópia do histórico (mensagens antigas)**\n"
+        "/copyimages → só imagens **sem** legenda\n"
+        "/copyimagescaption → imagens **com** legenda\n"
+        "/copyall → tudo sem legenda\n"
+        "/copyallcaption → tudo com legenda\n\n"
+        "**3. Cópia ao vivo (só o que for postado a partir de agora)**\n"
+        "/liveimages `@origem` `@destino`\n"
+        "/liveimagescaption `@origem` `@destino`\n"
+        "/liveall `@origem` `@destino`\n\n"
+        "**4. Controle**\n"
+        "/status → mostra tudo que está rodando\n"
+        "/stoplive → para todas as cópias ao vivo\n"
+        "/stoplive `número` → para uma cópia ao vivo específica\n"
+        "/stopcopy → para todas as cópias de histórico\n"
+        "/stopcopy `número` → para uma cópia de histórico específica\n\n"
+        "Você pode rodar **várias cópias ao mesmo tempo**."
     )
 
 
@@ -118,242 +125,295 @@ async def cmd_start(event: Message):
 async def cmd_setsource(event: Message):
     if not event.is_private:
         return
-    source = event.pattern_match.group(1).strip()
-    config["source"] = source
+    config["source"] = event.pattern_match.group(1).strip()
     save_config(config)
-    await event.reply(f"✅ Canal de **origem** definido:\n`{source}`")
-    logger.info(f"Origem definida: {source}")
+    await event.reply(f"✅ Origem temporária: `{config['source']}`")
 
 
 @client.on(events.NewMessage(pattern=r"(?i)^/setdest\s+(.+)$"))
 async def cmd_setdest(event: Message):
     if not event.is_private:
         return
-    dest = event.pattern_match.group(1).strip()
-    config["dest"] = dest
+    config["dest"] = event.pattern_match.group(1).strip()
     save_config(config)
-    await event.reply(f"✅ Canal de **destino** definido:\n`{dest}`")
-    logger.info(f"Destino definido: {dest}")
+    await event.reply(f"✅ Destino temporário: `{config['dest']}`")
 
 
 @client.on(events.NewMessage(pattern=r"(?i)^/status$"))
 async def cmd_status(event: Message):
     if not event.is_private:
         return
-    source = config.get("source") or "_não definido_"
-    dest = config.get("dest") or "_não definido_"
-    status = "🔄 Copiando..." if copying else "⏸️ Parado"
-    await event.reply(
-        f"**Configuração atual:**\n\n"
-        f"Origem: `{source}`\n"
-        f"Destino: `{dest}`\n"
-        f"Status: {status}"
-    )
+
+    text = "**Status atual**\n\n"
+
+    # Cópias de histórico
+    if history_tasks:
+        text += "**Cópias de histórico em andamento:**\n"
+        for tid, task in history_tasks.items():
+            text += f"  #{tid} – rodando\n"
+    else:
+        text += "Cópias de histórico: nenhuma\n"
+
+    # Cópias ao vivo
+    jobs = config.get("live_jobs", [])
+    if jobs:
+        text += "\n**Cópias ao vivo ativas:**\n"
+        for i, job in enumerate(jobs, 1):
+            mode = job.get("mode", "?")
+            text += f"  #{i} `{job['source']}` → `{job['dest']}` ({mode})\n"
+    else:
+        text += "\nCópias ao vivo: nenhuma\n"
+
+    text += f"\nOrigem temporária: `{config.get('source') or 'não definida'}`\n"
+    text += f"Destino temporário: `{config.get('dest') or 'não definido'}`"
+
+    await event.reply(text)
 
 
-@client.on(events.NewMessage(pattern=r"(?i)^/stop$"))
-async def cmd_stop(event: Message):
-    if not event.is_private:
-        return
-    config["source"] = None
-    config["dest"] = None
-    save_config(config)
-    await event.reply("🛑 Cópia de mensagens novas parada.")
-    logger.info("Configuração limpa pelo usuário")
-
-
-@client.on(events.NewMessage(pattern=r"(?i)^/stopcopy$"))
-async def cmd_stopcopy(event: Message):
-    if not event.is_private:
-        return
-    global stop_requested
-    if not copying:
-        await event.reply("Nenhuma cópia em andamento.")
-        return
-    stop_requested = True
-    await event.reply("⏹️ Parando a cópia... Aguarde.")
-    logger.info("Usuário solicitou parar a cópia")
-
+# ---------- Cópia de histórico ----------
 
 @client.on(events.NewMessage(pattern=r"(?i)^/copyimages$"))
 async def cmd_copyimages(event: Message):
-    if not event.is_private:
-        return
-    await copy_history(event, only_photos=True)
+    if event.is_private:
+        await start_history_copy(event, only_photos=True, with_caption=False)
 
+@client.on(events.NewMessage(pattern=r"(?i)^/copyimagescaption$"))
+async def cmd_copyimagescaption(event: Message):
+    if event.is_private:
+        await start_history_copy(event, only_photos=True, with_caption=True)
 
 @client.on(events.NewMessage(pattern=r"(?i)^/copyall$"))
 async def cmd_copyall(event: Message):
-    if not event.is_private:
-        return
-    await copy_history(event, only_photos=False)
+    if event.is_private:
+        await start_history_copy(event, only_photos=False, with_caption=False)
+
+@client.on(events.NewMessage(pattern=r"(?i)^/copyallcaption$"))
+async def cmd_copyallcaption(event: Message):
+    if event.is_private:
+        await start_history_copy(event, only_photos=False, with_caption=True)
 
 
-async def copy_history(event: Message, only_photos: bool = True):
-    global copying, stop_requested
+async def start_history_copy(event, only_photos, with_caption):
+    global next_task_id
 
     source = config.get("source")
     dest = config.get("dest")
-
     if not source or not dest:
-        await event.reply(
-            "❌ Defina primeiro os canais:\n"
-            "/setsource @canal\n"
-            "/setdest @canal"
-        )
+        await event.reply("❌ Use antes:\n/setsource @canal\n/setdest @canal")
         return
 
-    if copying:
-        await event.reply("⚠️ Já existe uma cópia em andamento.\nUse /stopcopy para parar.")
-        return
+    task_id = next_task_id
+    next_task_id += 1
+    stop_flags[task_id] = False
 
-    copying = True
-    stop_requested = False
-    tipo = "imagens" if only_photos else "todas as mensagens"
-    status_msg = await event.reply(
-        f"🔄 Iniciando cópia de **{tipo}**\n"
-        f"• Sem tag de encaminhamento\n"
-        f"• Sem legendas\n"
-        f"• Álbuns preservados\n\n"
-        f"Use /stopcopy para parar."
+    modo = "imagens" if only_photos else "tudo"
+    legenda = "com legenda" if with_caption else "sem legenda"
+
+    status = await event.reply(
+        f"🔄 Cópia #{task_id} iniciada\n"
+        f"{modo} | {legenda}\n"
+        f"`{source}` → `{dest}`\n\n"
+        f"Use /stopcopy {task_id} para parar esta."
     )
 
-    count = 0
-    errors = 0
-    processed_groups = set()
-
-    try:
-        # Primeiro coleta as mensagens (para agrupar álbuns corretamente)
-        messages = []
-        async for message in client.iter_messages(source, reverse=True):
-            if only_photos and not message.photo:
-                continue
-            if not message.media and not message.text:
-                continue
-            messages.append(message)
-
-        i = 0
-        while i < len(messages):
-            if stop_requested:
-                await status_msg.edit(
-                    f"⏹️ Cópia interrompida pelo usuário.\n\n"
-                    f"Total enviado: **{count}**\n"
-                    f"Erros: **{errors}**"
-                )
-                break
-
-            message = messages[i]
-
-            # Se faz parte de um álbum
-            if message.grouped_id:
-                if message.grouped_id in processed_groups:
-                    i += 1
+    async def runner():
+        count = 0
+        errors = 0
+        processed_groups = set()
+        try:
+            messages = []
+            async for msg in client.iter_messages(source, reverse=True):
+                if only_photos and not msg.photo:
                     continue
+                if not msg.media and not msg.text:
+                    continue
+                messages.append(msg)
 
-                # Coleta todas as mensagens do mesmo álbum
-                album = [m for m in messages if m.grouped_id == message.grouped_id]
-                processed_groups.add(message.grouped_id)
-
-                try:
-                    await send_album_without_tag(dest, album)
-                    count += len(album)
-                    await asyncio.sleep(2)
-                except FloodWaitError as e:
-                    logger.warning(f"FloodWait: esperando {e.seconds}s")
-                    await status_msg.edit(
-                        f"⏳ Telegram pediu para esperar {e.seconds}s...\n"
-                        f"Já copiei: **{count}**"
+            i = 0
+            while i < len(messages):
+                if stop_flags.get(task_id):
+                    await status.edit(
+                        f"⏹️ Cópia #{task_id} interrompida.\nEnviadas: **{count}**"
                     )
-                    await asyncio.sleep(e.seconds + 2)
+                    break
+
+                msg = messages[i]
+
+                if msg.grouped_id:
+                    if msg.grouped_id in processed_groups:
+                        i += 1
+                        continue
+                    album = [m for m in messages if m.grouped_id == msg.grouped_id]
+                    processed_groups.add(msg.grouped_id)
                     try:
-                        await send_album_without_tag(dest, album)
+                        await send_album(dest, album, with_caption)
                         count += len(album)
-                    except Exception as e2:
+                        await asyncio.sleep(2)
+                    except FloodWaitError as e:
+                        await asyncio.sleep(e.seconds + 2)
+                        try:
+                            await send_album(dest, album, with_caption)
+                            count += len(album)
+                        except Exception:
+                            errors += 1
+                    except Exception:
                         errors += 1
-                        logger.error(f"Erro no álbum: {e2}")
-                except Exception as e:
-                    errors += 1
-                    logger.error(f"Erro ao copiar álbum: {e}")
-
-            else:
-                # Mensagem individual
-                try:
-                    await send_without_forward_tag(dest, message, keep_caption=False)
-                    count += 1
-                    await asyncio.sleep(1.5)
-                except FloodWaitError as e:
-                    logger.warning(f"FloodWait: esperando {e.seconds}s")
-                    await status_msg.edit(
-                        f"⏳ Telegram pediu para esperar {e.seconds}s...\n"
-                        f"Já copiei: **{count}**"
-                    )
-                    await asyncio.sleep(e.seconds + 2)
+                else:
                     try:
-                        await send_without_forward_tag(dest, message, keep_caption=False)
+                        await send_media(dest, msg, with_caption)
                         count += 1
-                    except Exception as e2:
+                        await asyncio.sleep(1.5)
+                    except FloodWaitError as e:
+                        await asyncio.sleep(e.seconds + 2)
+                        try:
+                            await send_media(dest, msg, with_caption)
+                            count += 1
+                        except Exception:
+                            errors += 1
+                    except Exception:
                         errors += 1
-                        logger.error(f"Erro: {e2}")
-                except Exception as e:
-                    errors += 1
-                    logger.error(f"Erro ao copiar msg {message.id}: {e}")
 
-            if count % 10 == 0 and count > 0:
-                await status_msg.edit(
-                    f"🔄 Copiando...\n"
-                    f"• Sem tag | Sem legendas\n"
-                    f"Enviadas: **{count}**\n"
-                    f"Use /stopcopy para parar"
+                if count % 15 == 0 and count > 0:
+                    await status.edit(
+                        f"🔄 Cópia #{task_id}...\nEnviadas: **{count}**\n"
+                        f"/stopcopy {task_id} para parar"
+                    )
+                i += 1
+
+            if not stop_flags.get(task_id):
+                await status.edit(
+                    f"✅ Cópia #{task_id} finalizada!\nTotal: **{count}** | Erros: **{errors}**"
                 )
+        except Exception as e:
+            await status.edit(f"❌ Erro na cópia #{task_id}:\n`{e}`")
+        finally:
+            history_tasks.pop(task_id, None)
+            stop_flags.pop(task_id, None)
 
-            i += 1
-
-        if not stop_requested:
-            await status_msg.edit(
-                f"✅ Cópia finalizada!\n\n"
-                f"Total enviado: **{count}**\n"
-                f"Erros: **{errors}**"
-            )
-            logger.info(f"Cópia finalizada: {count} mensagens, {errors} erros")
-
-    except Exception as e:
-        await status_msg.edit(f"❌ Erro durante a cópia:\n`{e}`")
-        logger.error(f"Erro geral na cópia: {e}")
-
-    finally:
-        copying = False
-        stop_requested = False
+    task = asyncio.create_task(runner())
+    history_tasks[task_id] = task
 
 
-# ========== COPIADOR DE MENSAGENS NOVAS ==========
+@client.on(events.NewMessage(pattern=r"(?i)^/stopcopy(?:\s+(\d+))?$"))
+async def cmd_stopcopy(event: Message):
+    if not event.is_private:
+        return
+    arg = event.pattern_match.group(1)
+
+    if arg:
+        tid = int(arg)
+        if tid in stop_flags:
+            stop_flags[tid] = True
+            await event.reply(f"⏹️ Parando cópia de histórico #{tid}...")
+        else:
+            await event.reply(f"Cópia #{tid} não encontrada.")
+    else:
+        if not stop_flags:
+            await event.reply("Nenhuma cópia de histórico em andamento.")
+            return
+        for tid in list(stop_flags.keys()):
+            stop_flags[tid] = True
+        await event.reply("⏹️ Parando todas as cópias de histórico...")
+
+
+# ---------- Cópia ao vivo (só mensagens novas) ----------
+
+@client.on(events.NewMessage(pattern=r"(?i)^/liveimages\s+(\S+)\s+(\S+)$"))
+async def cmd_liveimages(event: Message):
+    if event.is_private:
+        await add_live_job(event, event.pattern_match.group(1), event.pattern_match.group(2), "images_no_caption")
+
+@client.on(events.NewMessage(pattern=r"(?i)^/liveimagescaption\s+(\S+)\s+(\S+)$"))
+async def cmd_liveimagescaption(event: Message):
+    if event.is_private:
+        await add_live_job(event, event.pattern_match.group(1), event.pattern_match.group(2), "images_with_caption")
+
+@client.on(events.NewMessage(pattern=r"(?i)^/liveall\s+(\S+)\s+(\S+)$"))
+async def cmd_liveall(event: Message):
+    if event.is_private:
+        await add_live_job(event, event.pattern_match.group(1), event.pattern_match.group(2), "all_no_caption")
+
+
+async def add_live_job(event, source, dest, mode):
+    source = source.strip()
+    dest = dest.strip()
+    job = {"source": source, "dest": dest, "mode": mode}
+    config.setdefault("live_jobs", []).append(job)
+    save_config(config)
+
+    modo_txt = {
+        "images_no_caption": "imagens sem legenda",
+        "images_with_caption": "imagens com legenda",
+        "all_no_caption": "tudo sem legenda",
+    }.get(mode, mode)
+
+    num = len(config["live_jobs"])
+    await event.reply(
+        f"✅ Cópia ao vivo #{num} ativada\n"
+        f"`{source}` → `{dest}`\n"
+        f"Modo: {modo_txt}\n\n"
+        f"Só copiará o que for postado **a partir de agora**."
+    )
+    logger.info(f"Live job adicionado: {source} -> {dest} ({mode})")
+
+
+@client.on(events.NewMessage(pattern=r"(?i)^/stoplive(?:\s+(\d+))?$"))
+async def cmd_stoplive(event: Message):
+    if not event.is_private:
+        return
+    arg = event.pattern_match.group(1)
+    jobs = config.get("live_jobs", [])
+
+    if not jobs:
+        await event.reply("Nenhuma cópia ao vivo ativa.")
+        return
+
+    if arg:
+        idx = int(arg) - 1
+        if 0 <= idx < len(jobs):
+            removed = jobs.pop(idx)
+            save_config(config)
+            await event.reply(f"⏹️ Cópia ao vivo #{idx+1} removida:\n`{removed['source']}` → `{removed['dest']}`")
+        else:
+            await event.reply("Número inválido. Use /status para ver a lista.")
+    else:
+        config["live_jobs"] = []
+        save_config(config)
+        await event.reply("⏹️ Todas as cópias ao vivo foram paradas.")
+
+
+# ---------- Handler de mensagens novas (ao vivo) ----------
 
 @client.on(events.NewMessage)
-async def copy_handler(event: Message):
-    source = config.get("source")
-    dest = config.get("dest")
-
-    if not source or not dest:
+async def live_handler(event: Message):
+    jobs = config.get("live_jobs", [])
+    if not jobs:
         return
 
     chat = await event.get_chat()
-    chat_username = f"@{chat.username}" if getattr(chat, "username", None) else None
-    chat_id = str(event.chat_id)
 
-    is_source = (
-        chat_id == str(source)
-        or (chat_username and chat_username.lower() == source.lower())
-        or str(getattr(chat, "id", "")) == str(source).replace("-100", "")
-    )
+    for job in jobs:
+        if not is_source_match(chat, job["source"]):
+            continue
 
-    if not is_source:
-        return
+        mode = job["mode"]
+        dest = job["dest"]
 
-    try:
-        # Mensagens novas também sem legenda
-        await send_without_forward_tag(dest, event.message, keep_caption=False)
-        logger.info(f"Mensagem nova {event.message.id} copiada (sem tag/legenda) → {dest}")
-    except Exception as e:
-        logger.error(f"Erro ao copiar mensagem nova: {e}")
+        # Filtra conforme o modo
+        if mode.startswith("images") and not event.message.photo:
+            continue
+
+        with_caption = "with_caption" in mode
+
+        try:
+            if event.message.grouped_id:
+                # Para álbuns ao vivo é mais complexo; envia individual por enquanto
+                await send_media(dest, event.message, with_caption)
+            else:
+                await send_media(dest, event.message, with_caption)
+            logger.info(f"Live: {event.message.id} → {dest} ({mode})")
+        except Exception as e:
+            logger.error(f"Erro live: {e}")
 
 
 async def main():
@@ -361,7 +421,7 @@ async def main():
     await client.start()
     me = await client.get_me()
     print(f"Conectado como: {me.first_name} ({me.id})")
-    print("Envie /start no chat privado (ou Mensagens Salvas) para ver os comandos.\n")
+    print("Envie /start em Mensagens Salvas para ver todos os comandos.\n")
     await client.run_until_disconnected()
 
 
