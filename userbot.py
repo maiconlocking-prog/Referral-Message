@@ -6,7 +6,7 @@ import sys
 import subprocess
 from pathlib import Path
 
-from telethon import TelegramClient, events, Button
+from telethon import TelegramClient, events
 from telethon.tl.custom import Message
 from telethon.errors import FloodWaitError
 
@@ -39,36 +39,30 @@ client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 history_tasks = {}
 stop_flags = {}
 next_task_id = 1
-pending = {}
 
-def kb_main():
-    return [
-        [Button.text("Historico", resize=True), Button.text("Ao vivo", resize=True)],
-        [Button.text("Controle", resize=True), Button.text("Status", resize=True)],
-        [Button.text("Atualizar", resize=True), Button.text("Fechar menu", resize=True)],
-    ]
+MENU = """**Referral Message**
 
-def kb_hist():
-    return [
-        [Button.text("Origem", resize=True), Button.text("Destino", resize=True)],
-        [Button.text("Img sem legenda", resize=True), Button.text("Img com legenda", resize=True)],
-        [Button.text("Tudo sem legenda", resize=True), Button.text("Tudo com legenda", resize=True)],
-        [Button.text("Parar historico", resize=True), Button.text("Menu", resize=True)],
-    ]
+**Historico (mensagens antigas)**
+`/setsource @canal` — origem
+`/setdest @canal` — destino
+`/copyimages` — imagens sem legenda
+`/copyimagescaption` — imagens com legenda
+`/copyall` — tudo sem legenda
+`/copyallcaption` — tudo com legenda
+`/stopcopy` — parar historico
 
-def kb_live():
-    return [
-        [Button.text("Live img sem legenda", resize=True)],
-        [Button.text("Live img com legenda", resize=True)],
-        [Button.text("Live tudo sem legenda", resize=True)],
-        [Button.text("Parar lives", resize=True), Button.text("Menu", resize=True)],
-    ]
+**Ao vivo (so postagens novas)**
+`/liveimages @origem @destino`
+`/liveimagescaption @origem @destino`
+`/liveall @origem @destino`
+`/stoplive` — parar todos os lives
 
-def kb_ctrl():
-    return [
-        [Button.text("Pausar", resize=True), Button.text("Retomar", resize=True)],
-        [Button.text("Menu", resize=True)],
-    ]
+**Controle**
+`/status` — ver o que esta rodando
+`/pause` — pausar tudo (bot continua ligado)
+`/resume` — voltar a copiar
+`/update` — atualizar codigo e reiniciar
+"""
 
 async def send_media(dest, message, with_caption=False):
     caption = (message.text or None) if with_caption else None
@@ -118,122 +112,34 @@ async def status_text():
 
 @client.on(events.NewMessage(pattern=r"(?i)^/start$"))
 async def cmd_start(event: Message):
+    if event.is_private:
+        await event.respond(MENU)
+
+@client.on(events.NewMessage(pattern=r"(?i)^/status$"))
+async def cmd_status(event: Message):
+    if event.is_private:
+        await event.respond(await status_text())
+
+@client.on(events.NewMessage(pattern=r"(?i)^/pause$"))
+async def cmd_pause(event: Message):
     if not event.is_private:
         return
-    await event.respond("**Referral Message**\n\nUse os botoes abaixo:", buttons=kb_main())
+    config["paused"] = True
+    save_config(config)
+    for tid in list(stop_flags.keys()):
+        stop_flags[tid] = True
+    await event.respond("Bot PAUSADO. Use /resume para voltar.")
 
-@client.on(events.NewMessage(pattern=r"(?i)^Historico$"))
-async def menu_hist(event: Message):
-    if event.is_private:
-        await event.respond("**Historico**\n1. Defina Origem e Destino\n2. Escolha o tipo", buttons=kb_hist())
+@client.on(events.NewMessage(pattern=r"(?i)^/resume$"))
+async def cmd_resume(event: Message):
+    if not event.is_private:
+        return
+    config["paused"] = False
+    save_config(config)
+    await event.respond(f"Bot ATIVO. Lives: {len(config.get('live_jobs', []))}")
 
-@client.on(events.NewMessage(pattern=r"(?i)^Ao vivo$"))
-async def menu_live(event: Message):
-    if event.is_private:
-        await event.respond("**Ao vivo**\nToque e envie: @origem @destino", buttons=kb_live())
-
-@client.on(events.NewMessage(pattern=r"(?i)^Controle$"))
-async def menu_ctrl(event: Message):
-    if event.is_private:
-        await event.respond("**Controle**", buttons=kb_ctrl())
-
-@client.on(events.NewMessage(pattern=r"(?i)^Status$"))
-async def menu_status(event: Message):
-    if event.is_private:
-        await event.respond(await status_text(), buttons=kb_main())
-
-@client.on(events.NewMessage(pattern=r"(?i)^Menu$"))
-async def menu_back(event: Message):
-    if event.is_private:
-        await event.respond("**Menu principal**", buttons=kb_main())
-
-@client.on(events.NewMessage(pattern=r"(?i)^Fechar menu$"))
-async def menu_close(event: Message):
-    if event.is_private:
-        await event.respond("Menu fechado. /start para abrir.", buttons=Button.clear())
-
-@client.on(events.NewMessage(pattern=r"(?i)^Origem$"))
-async def btn_source(event: Message):
-    if event.is_private:
-        pending[event.sender_id] = {"action": "set_source"}
-        await event.respond("Envie o canal de origem (@canal ou ID):")
-
-@client.on(events.NewMessage(pattern=r"(?i)^Destino$"))
-async def btn_dest(event: Message):
-    if event.is_private:
-        pending[event.sender_id] = {"action": "set_dest"}
-        await event.respond("Envie o canal de destino (@canal ou ID):")
-
-@client.on(events.NewMessage(pattern=r"(?i)^Img sem legenda$"))
-async def btn_copy_img(event: Message):
-    if event.is_private:
-        await start_history_copy(event, True, False)
-
-@client.on(events.NewMessage(pattern=r"(?i)^Img com legenda$"))
-async def btn_copy_img_cap(event: Message):
-    if event.is_private:
-        await start_history_copy(event, True, True)
-
-@client.on(events.NewMessage(pattern=r"(?i)^Tudo sem legenda$"))
-async def btn_copy_all(event: Message):
-    if event.is_private:
-        await start_history_copy(event, False, False)
-
-@client.on(events.NewMessage(pattern=r"(?i)^Tudo com legenda$"))
-async def btn_copy_all_cap(event: Message):
-    if event.is_private:
-        await start_history_copy(event, False, True)
-
-@client.on(events.NewMessage(pattern=r"(?i)^Parar historico$"))
-async def btn_stop_hist(event: Message):
-    if event.is_private:
-        for tid in list(stop_flags.keys()):
-            stop_flags[tid] = True
-        await event.respond("Historico parado.", buttons=kb_hist())
-
-@client.on(events.NewMessage(pattern=r"(?i)^Live img sem legenda$"))
-async def btn_live_img(event: Message):
-    if event.is_private:
-        pending[event.sender_id] = {"action": "live", "mode": "images_no_caption"}
-        await event.respond("Envie: @origem @destino")
-
-@client.on(events.NewMessage(pattern=r"(?i)^Live img com legenda$"))
-async def btn_live_img_cap(event: Message):
-    if event.is_private:
-        pending[event.sender_id] = {"action": "live", "mode": "images_with_caption"}
-        await event.respond("Envie: @origem @destino")
-
-@client.on(events.NewMessage(pattern=r"(?i)^Live tudo sem legenda$"))
-async def btn_live_all(event: Message):
-    if event.is_private:
-        pending[event.sender_id] = {"action": "live", "mode": "all_no_caption"}
-        await event.respond("Envie: @origem @destino")
-
-@client.on(events.NewMessage(pattern=r"(?i)^Parar lives$"))
-async def btn_stop_live(event: Message):
-    if event.is_private:
-        config["live_jobs"] = []
-        save_config(config)
-        await event.respond("Lives parados.", buttons=kb_live())
-
-@client.on(events.NewMessage(pattern=r"(?i)^Pausar$"))
-async def btn_pause(event: Message):
-    if event.is_private:
-        config["paused"] = True
-        save_config(config)
-        for tid in list(stop_flags.keys()):
-            stop_flags[tid] = True
-        await event.respond("Bot PAUSADO.", buttons=kb_ctrl())
-
-@client.on(events.NewMessage(pattern=r"(?i)^Retomar$"))
-async def btn_resume(event: Message):
-    if event.is_private:
-        config["paused"] = False
-        save_config(config)
-        await event.respond(f"Bot ATIVO. Lives: {len(config.get('live_jobs', []))}", buttons=kb_ctrl())
-
-@client.on(events.NewMessage(pattern=r"(?i)^Atualizar$"))
-async def btn_update(event: Message):
+@client.on(events.NewMessage(pattern=r"(?i)^/update$"))
+async def cmd_update(event: Message):
     if not event.is_private:
         return
     await event.respond("Atualizando...")
@@ -248,69 +154,6 @@ async def btn_update(event: Message):
         os.execv(sys.executable, [sys.executable] + sys.argv)
     except Exception as e:
         await event.respond(f"Erro: {e}")
-
-@client.on(events.NewMessage(func=lambda e: e.is_private and e.sender_id in pending and e.text and not e.text.startswith("/")))
-async def on_pending(event: Message):
-    # ignora se for texto de botao do menu
-    menu_words = {
-        "Historico", "Ao vivo", "Controle", "Status", "Menu", "Fechar menu",
-        "Origem", "Destino", "Img sem legenda", "Img com legenda", "Tudo sem legenda",
-        "Tudo com legenda", "Parar historico", "Live img sem legenda", "Live img com legenda",
-        "Live tudo sem legenda", "Parar lives", "Pausar", "Retomar", "Atualizar",
-    }
-    if event.text.strip() in menu_words:
-        return
-    uid = event.sender_id
-    state = pending.pop(uid, None)
-    if not state:
-        return
-    text = event.text.strip()
-    action = state["action"]
-    if action == "set_source":
-        config["source"] = text
-        save_config(config)
-        await event.respond(f"Origem: `{text}`", buttons=kb_hist())
-    elif action == "set_dest":
-        config["dest"] = text
-        save_config(config)
-        await event.respond(f"Destino: `{text}`", buttons=kb_hist())
-    elif action == "live":
-        parts = text.split()
-        if len(parts) < 2:
-            await event.respond("Formato: @origem @destino")
-            pending[uid] = state
-            return
-        source, dest = parts[0], parts[1]
-        mode = state["mode"]
-        config.setdefault("live_jobs", []).append({"source": source, "dest": dest, "mode": mode})
-        save_config(config)
-        await event.respond(f"Live: `{source}` -> `{dest}`", buttons=kb_live())
-
-@client.on(events.NewMessage(pattern=r"(?i)^/status$"))
-async def cmd_status(event: Message):
-    if event.is_private:
-        await event.respond(await status_text())
-
-@client.on(events.NewMessage(pattern=r"(?i)^/pause$"))
-async def cmd_pause(event: Message):
-    if event.is_private:
-        config["paused"] = True
-        save_config(config)
-        for tid in list(stop_flags.keys()):
-            stop_flags[tid] = True
-        await event.respond("Pausado.")
-
-@client.on(events.NewMessage(pattern=r"(?i)^/resume$"))
-async def cmd_resume(event: Message):
-    if event.is_private:
-        config["paused"] = False
-        save_config(config)
-        await event.respond("Ativo.")
-
-@client.on(events.NewMessage(pattern=r"(?i)^/update$"))
-async def cmd_update(event: Message):
-    if event.is_private:
-        await btn_update(event)
 
 @client.on(events.NewMessage(pattern=r"(?i)^/setsource\s+(.+)$"))
 async def cmd_setsource(event: Message):
@@ -351,21 +194,21 @@ async def _(e):
     if e.is_private:
         config.setdefault("live_jobs", []).append({"source": e.pattern_match.group(1), "dest": e.pattern_match.group(2), "mode": "images_no_caption"})
         save_config(config)
-        await e.respond("Live ativado.")
+        await e.respond(f"Live ativado: `{e.pattern_match.group(1)}` -> `{e.pattern_match.group(2)}` (img sem legenda)")
 
 @client.on(events.NewMessage(pattern=r"(?i)^/liveimagescaption\s+(\S+)\s+(\S+)$"))
 async def _(e):
     if e.is_private:
         config.setdefault("live_jobs", []).append({"source": e.pattern_match.group(1), "dest": e.pattern_match.group(2), "mode": "images_with_caption"})
         save_config(config)
-        await e.respond("Live ativado.")
+        await e.respond(f"Live ativado: `{e.pattern_match.group(1)}` -> `{e.pattern_match.group(2)}` (img com legenda)")
 
 @client.on(events.NewMessage(pattern=r"(?i)^/liveall\s+(\S+)\s+(\S+)$"))
 async def _(e):
     if e.is_private:
         config.setdefault("live_jobs", []).append({"source": e.pattern_match.group(1), "dest": e.pattern_match.group(2), "mode": "all_no_caption"})
         save_config(config)
-        await e.respond("Live ativado.")
+        await e.respond(f"Live ativado: `{e.pattern_match.group(1)}` -> `{e.pattern_match.group(2)}` (tudo)")
 
 @client.on(events.NewMessage(pattern=r"(?i)^/stopcopy"))
 async def cmd_stopcopy(event: Message):
@@ -384,11 +227,11 @@ async def cmd_stoplive(event: Message):
 async def start_history_copy(event, only_photos, with_caption):
     global next_task_id
     if config.get("paused"):
-        await event.respond("Bot pausado. Use Retomar.")
+        await event.respond("Bot pausado. Use /resume.")
         return
     source, dest = config.get("source"), config.get("dest")
     if not source or not dest:
-        await event.respond("Defina Origem e Destino no menu Historico.")
+        await event.respond("Use antes:\n/setsource @canal\n/setdest @canal")
         return
     task_id = next_task_id
     next_task_id += 1
