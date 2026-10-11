@@ -27,42 +27,73 @@ cd Referral-Message
 1. Acesse: https://my.telegram.org
 2. Faça login com o **mesmo número** que você usa no Telegram
 3. Clique em **API development tools**
-4. Crie um aplicativo (pode colocar qualquer nome)
-5. Copie o `api_id` e o `api_hash`
+4. Crie um aplicativo e copie o `api_id` e o `api_hash`
 
-### 4. Definir as variáveis
+### 4. Definir API_ID e API_HASH
 ```bash
-export API_ID=12345678
-export API_HASH="abcdef1234567890abcdef1234567890"
-export SOURCE_CHANNEL="@canal_origem"
-export DEST_CHANNEL="@canal_destino"
+export API_ID=39897941
+export API_HASH="3951ac4e1d548390392f4b05754cdc9c"
 ```
-
-> Você pode usar `@username` ou o ID numérico (`-100...`)
 
 ### 5. Rodar o userbot
 ```bash
 python userbot.py
 ```
 
-Na primeira vez ele vai pedir:
-- Seu número de telefone (com código do país, ex: +5511999999999)
-- O código que chegar no Telegram
-- (Se tiver) senha de verificação em duas etapas
+Na primeira vez ele vai pedir seu número e o código do Telegram.
 
-Depois disso ele fica rodando e copiando as mensagens automaticamente.
+### 6. Configurar os canais por comando
+
+Abra o Telegram → **Mensagens Salvas** (ou qualquer chat privado) e envie:
+
+```
+/start
+```
+
+Depois:
+
+```
+/setsource @canal_de_origem
+```
+
+ou com ID:
+
+```
+/setsource -1001234567890
+```
+
+```
+/setdest @canal_de_destino
+```
+
+Para ver a configuração atual:
+
+```
+/status
+```
+
+Para parar de copiar:
+
+```
+/stop
+```
+
+## Comandos disponíveis
+
+| Comando              | Função                          |
+|----------------------|---------------------------------|
+| `/start`             | Mostra a ajuda                  |
+| `/setsource @canal`  | Define o canal de origem        |
+| `/setdest @canal`    | Define o canal de destino       |
+| `/status`            | Mostra a configuração atual    |
+| `/stop`              | Para de copiar e limpa config   |
 
 ## Observações importantes
 
 - A conta usada **precisa estar no canal de origem** (pode ser só membro)
 - A conta usada **precisa conseguir postar** no canal de destino (geralmente ser admin)
-- Não compartilhe o arquivo `referral_session.session` (ele contém a sessão da sua conta)
-- Use com moderção para evitar risco de limitação da conta
-
-## Arquivos
-
-- `userbot.py` → versão userbot (Telethon) → **recomendada**
-- `bot.py` → versão bot normal (precisa ser admin nos dois canais)
+- Não compartilhe o arquivo `referral_session.session`
+- A configuração é salva no arquivo `config.json`
 
 ## Licença
 
