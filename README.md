@@ -1,65 +1,69 @@
 # Referral Message
 
-Bot do Telegram que copia automaticamente mensagens e mídias de um canal para outro.
+Userbot do Telegram que copia automaticamente mensagens e mídias de um canal para outro.
 
-## Funcionalidades
+## Diferença do bot normal
 
-- Ao dar `/start`, configura o canal de origem e o canal de destino
-- Copia **textos, fotos, vídeos, documentos e qualquer mídia**
-- Usa `copy_message` (sem a tag "Encaminhado de")
-- Funciona com canais públicos e privados (bot precisa ser admin)
+- **Não precisa ser administrador** no canal de **origem**
+- Funciona como uma conta de usuário normal
+- Ainda precisa ter permissão de postar no canal de **destino** (ser admin ou dono)
 
-## Como usar
+## Como usar no Termux
 
-### 1. Criar o bot
-1. Fale com [@BotFather](https://t.me/BotFather)
-2. Envie `/newbot` e siga as instruções
-3. Copie o token gerado
-
-### 2. Instalar dependências
+### 1. Instalar dependências
 ```bash
-pip install -r requirements.txt
+pkg update && pkg upgrade -y
+pkg install python git -y
+pip install telethon
 ```
 
-### 3. Definir o token (forma segura)
-
-**Nunca coloque o token no código ou no GitHub!**
-
-#### Linux / macOS:
+### 2. Clonar o repositório
 ```bash
-export BOT_TOKEN="seu_token_aqui"
+git clone https://github.com/maiconlocking-prog/Referral-Message.git
+cd Referral-Message
 ```
 
-#### Windows (PowerShell):
-```powershell
-$env:BOT_TOKEN="seu_token_aqui"
-```
+### 3. Pegar API_ID e API_HASH
+1. Acesse: https://my.telegram.org
+2. Faça login com o **mesmo número** que você usa no Telegram
+3. Clique em **API development tools**
+4. Crie um aplicativo (pode colocar qualquer nome)
+5. Copie o `api_id` e o `api_hash`
 
-#### Windows (CMD):
-```cmd
-set BOT_TOKEN=seu_token_aqui
-```
-
-### 4. Rodar o bot
+### 4. Definir as variáveis
 ```bash
-python bot.py
+export API_ID=12345678
+export API_HASH="abcdef1234567890abcdef1234567890"
+export SOURCE_CHANNEL="@canal_origem"
+export DEST_CHANNEL="@canal_destino"
 ```
 
-### 5. Configurar os canais
-1. Abra o bot no Telegram e envie `/start`
-2. Envie o canal de **origem** (ex: `@meucanal` ou `-1001234567890`)
-3. Envie o canal de **destino**
-4. Adicione o bot como **administrador** nos dois canais
-   - No canal de destino → dê permissão de **Publicar mensagens**
+> Você pode usar `@username` ou o ID numérico (`-100...`)
 
-Pronto! Todas as novas mensagens do canal de origem serão copiadas automaticamente para o destino.
+### 5. Rodar o userbot
+```bash
+python userbot.py
+```
 
-## Observações
+Na primeira vez ele vai pedir:
+- Seu número de telefone (com código do país, ex: +5511999999999)
+- O código que chegar no Telegram
+- (Se tiver) senha de verificação em duas etapas
 
-- O bot só copia mensagens **novas** (postadas depois da configuração)
-- As configurações ficam apenas em memória (reiniciar o bot apaga)
-- Para reconfigurar, envie `/start` novamente
+Depois disso ele fica rodando e copiando as mensagens automaticamente.
+
+## Observações importantes
+
+- A conta usada **precisa estar no canal de origem** (pode ser só membro)
+- A conta usada **precisa conseguir postar** no canal de destino (geralmente ser admin)
+- Não compartilhe o arquivo `referral_session.session` (ele contém a sessão da sua conta)
+- Use com moderção para evitar risco de limitação da conta
+
+## Arquivos
+
+- `userbot.py` → versão userbot (Telethon) → **recomendada**
+- `bot.py` → versão bot normal (precisa ser admin nos dois canais)
 
 ## Licença
 
-Livre para uso pessoal e comercial.
+Livre para uso pessoal.
