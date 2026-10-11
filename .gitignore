@@ -8,6 +8,9 @@
 *.session-journal
 referral_session*
 
+# Configuração local
+config.json
+
 # Python
 __pycache__/
 *.py[cod]
